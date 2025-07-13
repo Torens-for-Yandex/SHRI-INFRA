@@ -1,0 +1,138 @@
+name: Fix Release
+on:
+    workflow_dispatch:
+        inputs:
+            release_version:
+                description: 'Версия релиза для фикса'
+                required: true
+
+env:
+    REGISTRY_ID: ${{ secrets.YC_REGISTRY_ID }}
+
+jobs:
+    # 1. Проверки (параллельно)
+    lint: # заменил на lint, потому что нет тестов на типы, а на линт есть. Предполагаю что ошиблись в требованиях в задаче
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  ref: releases/${{ github.event.inputs.release_version }}
+            - run: npm install
+            - run: npm run lint 
+
+    test:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  ref: releases/${{ github.event.inputs.release_version }}
+            - run: npm install
+            - run: npm test
+
+    # 2. Сборка и загрузка образа
+    build_and_push:
+        needs: [lint, test]
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  ref: releases/${{ github.event.inputs.release_version }}
+
+            - name: Login to Yandex Container Registry
+              run: |
+                  echo "${{ secrets.YC_OAUTH_TOKEN }}" | \
+                  docker login \
+                    --username oauth \
+                    --password-stdin \
+                    cr.yandex
+
+            - name: Build and push Docker image
+              run: |
+                  # Формируем теги
+                  FIX_TAG="${{ github.event.inputs.release_version }}_fix${{ github.run_number }}"
+                  LATEST_TAG="${{ github.event.inputs.release_version }}_latest"
+
+                  # Собираем и пушим
+                  docker build -t cr.yandex/${{ env.REGISTRY_ID }}/app:${FIX_TAG} .
+                  docker tag cr.yandex/${{ env.REGISTRY_ID }}/app:${FIX_TAG} cr.yandex/${{ env.REGISTRY_ID }}/app:${LATEST_TAG}
+
+                  docker push cr.yandex/${{ env.REGISTRY_ID }}/app:${FIX_TAG}
+                  docker push cr.yandex/${{ env.REGISTRY_ID }}/app:${LATEST_TAG}
+
+                  # Сохраняем теги для следующих шагов
+                  echo "FIX_TAG=${FIX_TAG}" >> $GITHUB_ENV
+            
+
+    # 3. Создание тега
+    create_tag:
+      needs: build_and_push
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+          with:
+              ref: releases/${{ github.event.inputs.release_version }}
+
+        - name: Create fix tag
+          run: |
+            git tag v${{ github.event.inputs.release_version }}_fix${{ github.run_number }}
+            git push origin v${{ github.event.inputs.release_version }}_fix${{ github.run_number }}
+
+    # 4. Добавление комментария в Issue
+    add_comment_to_issue:
+      needs: [create_tag]
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            ref: releases/${{ github.event.inputs.release_version }}
+        
+        - name: Install GitHub CLI
+          run: sudo apt-get update && sudo apt-get install -y gh
+
+        - name: Find release issue
+          id: find-issue
+          run: |
+            ISSUE_ID=$(gh issue list --state open --search "Release v${{ github.event.inputs.release_version }}" --json number -q '.[0].number')
+            echo "issue_number=${ISSUE_ID}" >> $GITHUB_OUTPUT
+          env:
+            GH_TOKEN: ${{ github.token }}
+
+        - name: Get commit history
+          id: get-commits
+          run: |
+              git fetch --tags --force
+              
+              # Получаем список всех тегов, исключая фикс-теги, сортируем по версии
+              ALL_TAGS=$(git tag -l "v*" --sort=-v:refname | grep -v "_fix")
+              
+              # Берем последний релизный тег (первый в списке после сортировки)
+              PREV_TAG=$(echo "$ALL_TAGS" | head -n 1)
+              
+              # Если тегов нет, берем все коммиты
+              if [ -z "$PREV_TAG" ]; then
+                echo "No previous tags found, using all commits"
+                COMMITS=$(git log --pretty=format:"- %s")
+              else
+                echo "Comparing with previous tag: $PREV_TAG"
+                COMMITS=$(git log --pretty=format:"- %s" ${PREV_TAG}..HEAD)
+              fi
+              
+              # Сохраняем коммиты в output
+              echo "commits<<EOF" >> $GITHUB_OUTPUT
+              echo "$COMMITS" >> $GITHUB_OUTPUT
+              echo "EOF" >> $GITHUB_OUTPUT
+
+        - name: Add fix comment to issue
+          run: |
+            IMAGE_URL="cr.yandex/${{ env.REGISTRY_ID }}/app:${{ github.event.inputs.release_version }}_fix${{ github.run_number }}"
+
+            gh issue comment ${{ steps.find-issue.outputs.issue_number }} \
+              --body "### Фиксрелиз v${{ github.event.inputs.release_version }}_fix${{ github.run_number }}
+            **Дата**: $(date '+%Y-%m-%d %H:%M')
+            **Автор**: ${{ github.actor }}
+            **Docker-образ**: ${IMAGE_URL}
+            
+            **Изменения**:
+            ${{ steps.get-commits.outputs.commits }}"
+          env:
+            GH_TOKEN: ${{ github.token }}

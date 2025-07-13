@@ -1,0 +1,148 @@
+name: Release
+on:
+  workflow_dispatch: 
+
+env:
+  REGISTRY_ID: ${{ secrets.YC_REGISTRY_ID }}
+
+jobs:
+  # 1. Линтер и тесты (параллельно)
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm install
+      - run: npm run lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm install
+      - run: npm run test
+
+  # 2. Создание релизной ветки
+  create_release_branch:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create release branch
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git checkout -b releases/${{ github.run_number }}
+          git push origin releases/${{ github.run_number }}
+
+  # 3. Сборка и загрузка Docker-образа
+  build_and_push:
+    needs: create_release_branch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login to Yandex Container Registry
+        run: |
+          echo "${{ secrets.YC_OAUTH_TOKEN }}" | \
+          docker login \
+            --username oauth \
+            --password-stdin \
+            cr.yandex
+
+      - name: Build and push Docker image
+        run: |
+          docker build -t cr.yandex/${{ secrets.YC_REGISTRY_ID }}/app:${{ github.run_number }} -f ./Dockerfile .
+          docker tag cr.yandex/${{ secrets.YC_REGISTRY_ID }}/app:${{ github.run_number }} cr.yandex/${{ secrets.YC_REGISTRY_ID }}/app:${{ github.run_number }}_latest
+          docker push cr.yandex/${{ secrets.YC_REGISTRY_ID }}/app:${{ github.run_number }}
+          docker push cr.yandex/${{ secrets.YC_REGISTRY_ID }}/app:${{ github.run_number }}_latest
+
+  # 4. Создание Git-тега
+  create_tag:
+    needs: build_and_push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: git tag v${{ github.run_number }}
+      - run: git push origin v${{ github.run_number }}
+
+  # 5. Создание Issue с информацией о релизе
+  create_issue:
+    needs: create_tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      # Установка GitHub CLI
+      - name: Install GitHub CLI
+        run: sudo apt-get update && sudo apt-get install -y gh
+
+      # Получаем список коммитов между тегами
+      - name: Get commit history
+        id: get-commits
+        run: |
+          git fetch --tags
+          PREV_TAG=$(git describe --tags --abbrev=0 --match "v*" $(git rev-list --tags --skip=1 --max-count=1))
+          COMMITS=$(git log --pretty=format:"- %s" ${PREV_TAG}..HEAD)
+          echo "commits<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMMITS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      # Создаем Issue со всеми требуемыми данными
+      - name: Create release issue
+        run: |
+          gh issue create \
+            --title "Release v${{ github.run_number }}" \
+            --body "Дата: $(date '+%Y-%m-%d %H:%M')
+          Автор: ${{ github.actor }}
+          Версия: v${{ github.run_number }}
+          Docker-образ: cr.yandex/${{ env.REGISTRY_ID }}/app:${{ github.run_number }}
+          
+          Изменения с предыдущего релиза:
+          ${{ steps.get-commits.outputs.commits }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            
+  # 6. Обновление CHANGELOG.md
+  update_changelog:
+    needs: create_issue
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: releases/${{ github.run_number }}
+          fetch-depth: 0
+
+      - name: Update CHANGELOG.md
+        run: |
+          # Получаем предыдущий тег
+          git fetch --tags
+          PREV_TAG=$(git describe --tags --abbrev=0 --match "v*" $(git rev-list --tags --skip=1 --max-count=1) || echo "")
+
+          # Формируем содержимое
+          {
+            echo "# Релиз v${{ github.run_number }} ($(date '+%Y-%m-%d'))"
+            echo ""
+            
+            if [ -n "$PREV_TAG" ]; then
+              echo "## Изменения с ${PREV_TAG}"
+              git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)"
+            else
+              echo "## Первый релиз"
+              git log --pretty=format:"- %s (%h)"
+            fi
+            
+            echo ""
+            [ -f CHANGELOG.md ] && cat CHANGELOG.md || echo ""
+          } > TEMP_CHANGELOG.md
+
+          # Применяем изменения
+          mv TEMP_CHANGELOG.md CHANGELOG.md
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add CHANGELOG.md
+          git commit -m "Обновлён CHANGELOG для v${{ github.run_number }}"
+          git push origin releases/${{ github.run_number }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,91 @@
+name: Deploy
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Версия релиза для выкатки в прод'
+        required: true
+
+env:
+  REGISTRY_ID: ${{ secrets.YC_REGISTRY_ID }}
+  VM_IP: ${{ secrets.PRODUCTION_VM_IP }}
+  SSH_USER: ${{ secrets.SSH_USER }}
+  SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+jobs:
+  verify_image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Login to Yandex Container Registry
+        run: |
+          echo "${{ secrets.YC_OAUTH_TOKEN }}" | \
+          docker login \
+            --username oauth \
+            --password-stdin \
+            cr.yandex
+
+      - name: Check if image exists
+        run: |
+          IMAGE_TAG="${{ github.event.inputs.release_version }}_latest"
+          IMAGE="cr.yandex/${{ env.REGISTRY_ID }}/app:${IMAGE_TAG}"
+          
+          # Проверка через docker pull (проще и уже аутентифицирован)
+          docker pull ${IMAGE} || \
+          (echo "Image ${IMAGE} not found" && exit 1)
+
+  deploy_to_production:
+    needs: verify_image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan ${{ env.VM_IP }} >> ~/.ssh/known_hosts
+
+      - name: Deploy to production
+        run: |
+          IMAGE_TAG="${{ github.event.inputs.release_version }}_latest"
+          IMAGE="cr.yandex/${{ env.REGISTRY_ID }}/app:${IMAGE_TAG}"
+          
+          # Передаем токен в переменной окружения
+          ssh -o StrictHostKeyChecking=no ${{ env.SSH_USER }}@${{ env.VM_IP }} << EOF
+            echo "${{ secrets.YC_OAUTH_TOKEN }}" | docker login --username oauth --password-stdin cr.yandex
+            docker pull ${IMAGE}
+            docker stop app || true
+            docker rm app || true
+            docker run -d \
+              --name app \
+              --restart always \
+              -p 80:3000 \
+              ${IMAGE}
+          EOF
+
+  add_deploy_comment:
+    needs: deploy_to_production
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install GitHub CLI
+        run: sudo apt-get update && sudo apt-get install -y gh
+
+      - name: Find release issue
+        id: find-issue
+        run: |
+          ISSUE_ID=$(gh issue list --state open --search "Release v${{ github.event.inputs.release_version }}" --json number -q '.[0].number')
+          echo "issue_number=${ISSUE_ID}" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Add deploy comment to issue
+        run: |
+          gh issue comment ${{ steps.find-issue.outputs.issue_number }} \
+            --body "### Релиз v${{ github.event.inputs.release_version }} выкачен в прод
+          **Дата выкатки**: $(date '+%Y-%m-%d %H:%M')
+          **Выкатил**: ${{ github.actor }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
